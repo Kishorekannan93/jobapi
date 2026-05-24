@@ -1,0 +1,5 @@
+package com.jobai.dto;
+import lombok.AllArgsConstructor;
+import lombok.Data;
+@Data @AllArgsConstructor
+public class ChatResponse { private String reply; private String type; }
