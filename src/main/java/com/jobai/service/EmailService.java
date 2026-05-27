@@ -257,6 +257,7 @@
 //     }
 // }
 
+
 package com.jobai.service;
 
 import com.jobai.dto.BulkEmailResponse;
@@ -269,7 +270,6 @@ import jakarta.mail.MessagingException;
 import jakarta.mail.internet.MimeMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.mail.javamail.JavaMailSenderImpl;
 import org.springframework.mail.javamail.MimeMessageHelper;
@@ -291,18 +291,6 @@ public class EmailService {
     private final ResumeService resumeService;
     private final CompanyRepository companyRepository;
     private final EmailTemplateRepository emailTemplateRepository;
-
-    @Value("${spring.mail.host}")
-    private String smtpHost;
-
-    @Value("${spring.mail.port}")
-    private int smtpPort;
-
-    @Value("${spring.mail.username}")
-    private String smtpUsername;
-
-    @Value("${spring.mail.password}")
-    private String smtpPassword;
 
     public List<BulkEmailResponse> sendBulkEmails(MultipartFile resumeFile, User user) {
         List<Company> pendingCompanies = companyRepository.findByUserIdAndStatus(user.getId(), "pending");
@@ -333,7 +321,8 @@ public class EmailService {
             return List.of(new BulkEmailResponse("ALL", "FAILED", "Resume parsing failed: " + e.getMessage()));
         }
 
-        JavaMailSenderImpl mailSender = createMailSender();
+        // ✅ FIX: Create mail sender with USER'S Gmail credentials
+        JavaMailSenderImpl mailSender = createMailSender(user.getEmail(), user.getGmailAppPassword());
 
         for (Company company : pendingCompanies) {
             try {
@@ -341,7 +330,7 @@ public class EmailService {
                     log.warn("Skipping company {} - incomplete data", company.getCompanyName());
                     company.setStatus("failed");
                     companyRepository.save(company);
-                    results.add(new BulkEmailResponse(company.getCompanyName(), "FAILED", "Company data incomplete"));
+                    results.add(new BulkEmailResponse(company.getCompanyName(), "FAILED", "Company data incomplete (missing email/title)"));
                     continue;
                 }
 
@@ -354,14 +343,6 @@ public class EmailService {
                     user.getLinkedinUrl(),
                     user.getPortfolioUrl()
                 );
-
-                if (aiResponse.startsWith("ERROR:") || aiResponse.startsWith("Error")) {
-                    log.error("Gemini failed for {}: {}", company.getCompanyName(), aiResponse);
-                    company.setStatus("failed");
-                    companyRepository.save(company);
-                    results.add(new BulkEmailResponse(company.getCompanyName(), "FAILED", "AI generation failed: " + aiResponse));
-                    continue;
-                }
 
                 String subject = extractSubject(aiResponse);
                 String rawBody = extractBody(aiResponse);
@@ -409,21 +390,22 @@ public class EmailService {
             && company.getJobTitle() != null && !company.getJobTitle().isEmpty();
     }
 
-    private JavaMailSenderImpl createMailSender() {
+    // ✅ FIX: User's Gmail credentials use பண்ணுங்க
+    private JavaMailSenderImpl createMailSender(String email, String appPassword) {
         JavaMailSenderImpl sender = new JavaMailSenderImpl();
-        sender.setHost(smtpHost);
-        sender.setPort(smtpPort);
-        sender.setUsername(smtpUsername);
-        sender.setPassword(smtpPassword);
-
+        sender.setHost("smtp.gmail.com");
+        sender.setPort(587);
+        sender.setUsername(email);           // ✅ User's Gmail
+        sender.setPassword(appPassword);      // ✅ User's App Password
+        
         Properties props = sender.getJavaMailProperties();
         props.put("mail.smtp.auth", "true");
         props.put("mail.smtp.starttls.enable", "true");
         props.put("mail.smtp.starttls.required", "true");
-        props.put("mail.smtp.connectiontimeout", "15000");
+        props.put("mail.smtp.connectiontimeout", "15000");  // ✅ Increased timeout
         props.put("mail.smtp.timeout", "15000");
         props.put("mail.smtp.writetimeout", "15000");
-
+        
         return sender;
     }
 
@@ -440,14 +422,13 @@ public class EmailService {
         MimeMessage message = mailSender.createMimeMessage();
         MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
 
-        helper.setFrom(fromEmail, senderName);  // User's Gmail - recipient sees this
+        helper.setFrom(fromEmail, senderName);
         helper.setTo(to);
         helper.setSubject(subject);
         helper.setText(plainBody, htmlBody);
         helper.addAttachment("Resume.pdf", new ByteArrayResource(attachment.getBytes()));
 
         mailSender.send(message);
-        log.debug("Email sent successfully from {} to {}", fromEmail, to);
     }
 
     private String extractSubject(String aiResponse) {
@@ -456,7 +437,7 @@ public class EmailService {
         }
 
         String[] markers = {"SUBJECT:", "Subject:", "subject:"};
-        String[] bodyMarkers = {"BODY:", "Body:", "body:", "Dear", "Hi", "Hello"};
+        String[] bodyMarkers = {"BODY:", "Body:", "body:", "Dear"};
 
         for (String marker : markers) {
             int start = aiResponse.indexOf(marker);
@@ -503,29 +484,34 @@ public class EmailService {
     private String stripMarkdown(String text) {
         if (text == null) return "";
         return text
-            .replaceAll("(?s)\\*\\*(.+?)\\*\\*", "$1")
-            .replaceAll("(?s)\\*(.+?)\\*", "$1")
-            .replaceAll("(?s)```[\\s\\S]*?```", "")
+            .replaceAll("\\*\\*(.*?)\\*\\*", "$1")
+            .replaceAll("\\*(.*?)\\*", "$1")
+            .replaceAll("`{3}[\\s\\S]*?`{3}", "")
             .replaceAll("`([^`]*)`", "$1")
-            .replaceAll("(?m)^#+\\s+", "")
-            .replaceAll("(?m)^>\\s+", "")
-            .replaceAll("\\[([^\\]]*)\\]\\([^)]*\\)", "$1")
+            .replaceAll("#+\\s+", "")
+            .replaceAll("\\[([^\\]]*)]\\([^)]*\\)", "$1")
+            .replaceAll(">\\s+", "")
             .trim();
     }
 
     private String markdownToHtml(String text) {
         if (text == null) return "";
         String html = text
-            .replaceAll("(?s)\\*\\*(.+?)\\*\\*", "<b>$1</b>")
-            .replaceAll("(?s)\\*(.+?)\\*", "<i>$1</i>")
-            .replaceAll("(?s)```[\\s\\S]*?```", "<pre>$0</pre>")
+            .replaceAll("\\*\\*(.*?)\\*\\*", "<b>$1</b>")
+            .replaceAll("\\*(.*?)\\*", "<i>$1</i>")
+            .replaceAll("`{3}[\\s\\S]*?`{3}", "<pre>$0</pre>")
             .replaceAll("`([^`]*)`", "<code>$1</code>")
-            .replaceAll("\n", "<br>");
+            .replaceAll("\\n", "<br>");
         return "<html><body style='font-family: Arial, sans-serif; font-size: 14px; line-height: 1.6; color: #333;'>" + html + "</body></html>";
     }
 
-    public List<Company> getAllCompanies(Long userId) { return companyRepository.findByUserId(userId); }
-    public List<Company> getPendingCompanies(Long userId) { return companyRepository.findByUserIdAndStatus(userId, "pending"); }
+    public List<Company> getAllCompanies(Long userId) {
+        return companyRepository.findByUserId(userId);
+    }
+
+    public List<Company> getPendingCompanies(Long userId) {
+        return companyRepository.findByUserIdAndStatus(userId, "pending");
+    }
 
     public String getEmailStats(Long userId) {
         long total = companyRepository.findByUserId(userId).size();
