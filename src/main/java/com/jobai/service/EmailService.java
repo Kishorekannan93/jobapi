@@ -266,21 +266,23 @@ import com.jobai.entity.EmailTemplate;
 import com.jobai.entity.User;
 import com.jobai.repository.CompanyRepository;
 import com.jobai.repository.EmailTemplateRepository;
-import jakarta.mail.MessagingException;
-import jakarta.mail.internet.MimeMessage;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
-import org.springframework.core.io.ByteArrayResource;
-import org.springframework.mail.javamail.JavaMailSenderImpl;
-import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.beans.factory.annotation.Value;
+import org.springframework.http.HttpEntity;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.MediaType;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.RestTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
 import java.io.IOException;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
+import java.util.Base64;
+import java.util.HashMap;
 import java.util.List;
-import java.util.Properties;
+import java.util.Map;
 
 @Service
 @RequiredArgsConstructor
@@ -292,6 +294,14 @@ public class EmailService {
     private final CompanyRepository companyRepository;
     private final EmailTemplateRepository emailTemplateRepository;
 
+    @Value("${resend.api.key}")
+    private String resendApiKey;
+
+    @Value("${resend.from.email}")
+    private String fromEmail;
+
+    private final RestTemplate restTemplate = new RestTemplate();
+
     public List<BulkEmailResponse> sendBulkEmails(MultipartFile resumeFile, User user) {
         List<Company> pendingCompanies = companyRepository.findByUserIdAndStatus(user.getId(), "pending");
         List<BulkEmailResponse> results = new ArrayList<>();
@@ -300,11 +310,6 @@ public class EmailService {
 
         if (pendingCompanies.isEmpty()) {
             results.add(new BulkEmailResponse("N/A", "INFO", "No pending companies. Upload Excel first."));
-            return results;
-        }
-
-        if (user.getGmailAppPassword() == null || user.getGmailAppPassword().isEmpty()) {
-            results.add(new BulkEmailResponse("ALL", "FAILED", "Please add your Gmail App Password in Profile settings"));
             return results;
         }
 
@@ -321,16 +326,13 @@ public class EmailService {
             return List.of(new BulkEmailResponse("ALL", "FAILED", "Resume parsing failed: " + e.getMessage()));
         }
 
-        // ✅ FIX: Create mail sender with USER'S Gmail credentials
-        JavaMailSenderImpl mailSender = createMailSender(user.getEmail(), user.getGmailAppPassword());
-
         for (Company company : pendingCompanies) {
             try {
                 if (!isCompanyDataValid(company)) {
                     log.warn("Skipping company {} - incomplete data", company.getCompanyName());
                     company.setStatus("failed");
                     companyRepository.save(company);
-                    results.add(new BulkEmailResponse(company.getCompanyName(), "FAILED", "Company data incomplete (missing email/title)"));
+                    results.add(new BulkEmailResponse(company.getCompanyName(), "FAILED", "Company data incomplete"));
                     continue;
                 }
 
@@ -355,15 +357,13 @@ public class EmailService {
                 template.setGeneratedBody(plainBody);
                 emailTemplateRepository.save(template);
 
-                sendEmailWithAttachment(
-                    mailSender,
+                // ✅ Resend HTTP API - No SMTP ports!
+                sendEmailViaResendAPI(
                     company.getEmail(),
                     subject,
                     htmlBody,
-                    plainBody,
                     resumeFile,
-                    user.getName(),
-                    user.getEmail()
+                    user.getName()
                 );
 
                 company.setStatus("sent");
@@ -390,45 +390,39 @@ public class EmailService {
             && company.getJobTitle() != null && !company.getJobTitle().isEmpty();
     }
 
-    // ✅ FIX: User's Gmail credentials use பண்ணுங்க
-    private JavaMailSenderImpl createMailSender(String email, String appPassword) {
-        JavaMailSenderImpl sender = new JavaMailSenderImpl();
-        sender.setHost("smtp.gmail.com");
-        sender.setPort(587);
-        sender.setUsername(email);           // ✅ User's Gmail
-        sender.setPassword(appPassword);      // ✅ User's App Password
+    // ✅ Resend HTTP API - Uses HTTPS (port 443), never blocked!
+    private void sendEmailViaResendAPI(String to, String subject, String htmlBody,
+                                       MultipartFile attachment, String senderName) throws IOException {
         
-        Properties props = sender.getJavaMailProperties();
-        props.put("mail.smtp.auth", "true");
-        props.put("mail.smtp.starttls.enable", "true");
-        props.put("mail.smtp.starttls.required", "true");
-        props.put("mail.smtp.connectiontimeout", "15000");  // ✅ Increased timeout
-        props.put("mail.smtp.timeout", "15000");
-        props.put("mail.smtp.writetimeout", "15000");
+        String base64Attachment = Base64.getEncoder().encodeToString(attachment.getBytes());
+
+        Map<String, Object> requestBody = new HashMap<>();
+        requestBody.put("from", fromEmail);
+        requestBody.put("to", to);
+        requestBody.put("subject", subject);
+        requestBody.put("html", htmlBody);
         
-        return sender;
-    }
+        // Attachment
+        Map<String, String> attach = new HashMap<>();
+        attach.put("filename", "Resume.pdf");
+        attach.put("content", base64Attachment);
+        requestBody.put("attachments", List.of(attach));
 
-    private void sendEmailWithAttachment(
-            JavaMailSenderImpl mailSender,
-            String to,
-            String subject,
-            String htmlBody,
-            String plainBody,
-            MultipartFile attachment,
-            String senderName,
-            String fromEmail) throws MessagingException, IOException {
+        HttpHeaders headers = new HttpHeaders();
+        headers.setBearerAuth(resendApiKey);
+        headers.setContentType(MediaType.APPLICATION_JSON);
 
-        MimeMessage message = mailSender.createMimeMessage();
-        MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+        HttpEntity<Map<String, Object>> request = new HttpEntity<>(requestBody, headers);
 
-        helper.setFrom(fromEmail, senderName);
-        helper.setTo(to);
-        helper.setSubject(subject);
-        helper.setText(plainBody, htmlBody);
-        helper.addAttachment("Resume.pdf", new ByteArrayResource(attachment.getBytes()));
-
-        mailSender.send(message);
+        String url = "https://api.resend.com/emails";
+        
+        try {
+            Map response = restTemplate.postForObject(url, request, Map.class);
+            log.info("Resend API response: {}", response);
+        } catch (Exception e) {
+            log.error("Resend API error: {}", e.getMessage());
+            throw e;
+        }
     }
 
     private String extractSubject(String aiResponse) {
@@ -437,7 +431,7 @@ public class EmailService {
         }
 
         String[] markers = {"SUBJECT:", "Subject:", "subject:"};
-        String[] bodyMarkers = {"BODY:", "Body:", "body:", "Dear"};
+        String[] bodyMarkers = {"BODY:", "Body:", "body:", "Dear", "Hi", "Hello"};
 
         for (String marker : markers) {
             int start = aiResponse.indexOf(marker);
